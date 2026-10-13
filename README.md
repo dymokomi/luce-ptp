@@ -14,7 +14,8 @@ How the containers reach the camera is a transport's job:
 - **macOS** — the system's camera service takes every PTP camera when it is plugged in,
   so this package goes through ImageCaptureCore: an `ICDeviceBrowser` reports cameras,
   a session is opened on each, and the containers pass through untouched with
-  `requestSendPTPCommand:outData:completion:`.
+  `requestSendPTPCommand:outData:completion:`. Checked with a Leica M11-D
+  (firmware 2.6.4): DeviceInfo, storages, 26 DNGs listed and downloaded in pieces.
 - **virtual** — `ptp.virtual_camera(folder)` answers PTP from the files in a folder, for
   tests and for programs that want a camera without one.
 - **Linux and Windows** are not written yet (usbfs bulk transfers, and WPD's PTP

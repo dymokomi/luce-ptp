@@ -6,6 +6,7 @@
 import c
 import sync
 import thread
+from luce_std import clock
 from luce_std import files
 from luce_std import paths
 from luce_std.collections import List, TextPool
@@ -36,7 +37,9 @@ func explore(probe: Probe*) -> !:
     defer stores.destroy()
     try camera.storages(&stores)
     for id in stores.view():
-        let card = try camera.storage_info(id, &pool)
+        let card = camera.storage_info(id, &pool) catch failure:
+            print(f"card\t{id}\t{failure.message}")
+            continue
         print(f"card\t{id}\t{card.description}\t{card.label}\t{card.available} of {card.capacity} bytes free")
     var handles: List[u32]
     defer handles.destroy()
@@ -96,6 +99,10 @@ pub func main(arguments: c.str[]) -> i32:
         print("PASS watch: this system cannot reach cameras yet")
         return 0
     while not watcher.settled():
+        run_loop()
+    # Cameras plugged in already may still be reported after that: wait a little.
+    let began = clock.timestamp()
+    while watcher.count() == 0 and clock.timestamp() - began < 3.0:
         run_loop()
     if watcher.count() == 0:
         print("PASS watch: no camera plugged in")

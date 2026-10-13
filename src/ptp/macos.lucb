@@ -193,8 +193,14 @@ func mac_send(context: void*?):
     if let extra = carried:
         mac_msg_void(extra, mac_sel("release"))
 
-## The completion: ImageCaptureCore's answer to the command in flight.
+## The completion: ImageCaptureCore's answer to the command in flight, on a thread
+## of its own choosing (not one Luce started, so it is given the heap to grow the
+## buffers with).
 func mac_answered(block: LucePtpBlock*, data: void*?, response: void*?, failure: void*?):
+    with memory.heap:
+        mac_take_answer(block, data, response, failure)
+
+func mac_take_answer(block: LucePtpBlock*, data: void*?, response: void*?, failure: void*?):
     let link = (Link*)(block.link else return)
     link.lock.lock()
     if link.waiting:
