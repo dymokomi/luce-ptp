@@ -1,0 +1,72 @@
+#==============================================================================================
+#
+#   ptp - Cameras over the Picture Transfer Protocol
+#
+#   DESCRIPTION:
+#       PTP (ISO 15740, first PIMA 15740:2000) is how a camera plugged in by USB hands
+#       over its photos: the computer sends an operation (a code and up to five 32-bit
+#       parameters), data may follow either way, and the camera answers with a response
+#       code. Every value is little-endian; text is UCS-2 with a count in front. This
+#       package speaks the protocol itself: it builds the containers, reads the datasets
+#       (the device, its storages, each object) and downloads objects in pieces.
+#
+#       How a container reaches the camera is a Transport's business. On macOS the
+#       system's camera service owns every PTP camera from the moment it is plugged in,
+#       so the transport is ImageCaptureCore's PTP pass-through: the containers this
+#       package builds go to the camera untouched, inside the session the service holds.
+#       A virtual camera answers from a folder, for tests and for programs that want a
+#       camera without one. Linux (usbfs) and Windows (WPD's PTP pass-through) are not
+#       written yet; a Watcher there finds no camera and says `unavailable`.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb      error codes and the Transport
+#       codes.lucb       operation, response and object format codes
+#       wire.lucb        containers, and reading and writing their fields
+#       datasets.lucb    DeviceInfo, StorageInfo, ObjectInfo
+#       camera.lucb      a session: operations, listing, downloading
+#       virtual.lucb     a camera answering from a folder
+#       watcher.lucb     the cameras plugged in, as they come and go
+#       macos.lucb       ImageCaptureCore: the browser, sessions, the pass-through
+#       tests.lucb       the protocol against the virtual camera
+#
+#==============================================================================================
+import c
+import interop
+import memory
+import platform
+import strings
+import sync
+from luce_std import files
+from luce_std import paths
+from luce_std import utf8
+from luce_std.collections import Buffer, List, TextPool
+
+## This system has no way to reach a PTP camera this package knows.
+pub let unavailable: ErrorCode = ErrorCode.package(1)
+## The camera went away (unplugged, switched off, its session closed).
+pub let disconnected: ErrorCode = ErrorCode.package(2)
+## The camera answered an operation with a response other than OK.
+pub let refused: ErrorCode = ErrorCode.package(3)
+## What the camera sent does not read as PTP.
+pub let malformed: ErrorCode = ErrorCode.package(4)
+## A download was stopped by its caller.
+pub let cancelled: ErrorCode = ErrorCode.package(5)
+
+## How one transaction crosses to the camera. `exchange` sends the command container
+## `command` and, when the operation carries data to the camera, the data container
+## `data_out` (empty: none); it puts what the camera sends back in the data phase into
+## `data_in` (with or without its container header: the camera reads either) and the
+## response container into `response`. `close` lets the link go. `holds_session` says
+## the session is opened and closed by the other side (ImageCaptureCore), so the camera
+## never sends OpenSession or CloseSession itself.
+pub struct Transport:
+    pub var context: void*
+    pub var exchange: func(void*, const u8[], const u8[], Buffer*, Buffer*) -> unit!
+    pub var close: func(void*) -> unit
+    pub var holds_session: bool
+
+## A plain call back: `call(context)`, from whichever thread the event happens on.
+pub struct Wake:
+    pub var call: func(void*) -> unit
+    pub var context: void*

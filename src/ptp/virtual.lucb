@@ -1,0 +1,199 @@
+# mark: A virtual camera ======================================================================
+
+## The virtual camera's one storage, and its folders as a camera lays them out:
+## DCIM (handle 1) holding 100LUCE (handle 2) holding the files (handles 3 on).
+let virtual_storage: u32 = 0x00010001
+let dcim_handle: u32 = 1
+let roll_handle: u32 = 2
+let first_file: u32 = 3
+
+## A camera that answers PTP from the files directly in a folder.
+struct Virtual:
+    var folder: Buffer
+    var names: List[str]
+    var sizes: List[u32]
+    var pool: TextPool
+    var open: bool
+    ## Whether it offers GetPartialObject, and whether its data phase comes without
+    ## a container header (as ImageCaptureCore hands it over).
+    var partial: bool
+    var bare_data: bool
+    var reply: Buffer
+    var path: Buffer
+
+    func close():
+        self.folder.destroy()
+        self.names.destroy()
+        self.sizes.destroy()
+        self.pool.destroy()
+        self.reply.destroy()
+        self.path.destroy()
+
+    ## Answer `operation`: its data into `reply`, its response code returned.
+    func answer(operation: u16, parameters: const u32[]) -> u16!:
+        if operation == get_device_info:
+            try self.put_device_info()
+            return ok
+        if operation == open_session:
+            if self.open:
+                return session_already_open
+            self.open = true
+            return ok
+        if not self.open:
+            return 0x2003
+        if operation == close_session:
+            self.open = false
+            return ok
+        if operation == get_storage_ids:
+            try put_u32_array(&self.reply, [virtual_storage])
+            return ok
+        if operation == get_storage_info:
+            if parameters.length < 1 or parameters[0] != virtual_storage:
+                return 0x2008
+            for value in [4, 2, 0]:
+                try put_u16(&self.reply, (u16)value)
+            try put_u64(&self.reply, 34359738368)
+            try put_u64(&self.reply, 17179869184)
+            try put_u32(&self.reply, 0xFFFFFFFF)
+            try put_text(&self.reply, "Virtual card")
+            try put_text(&self.reply, paths.base(self.folder.text()))
+            return ok
+        if operation == get_object_handles:
+            try put_u32(&self.reply, (u32)(self.names.length() + 2))
+            for handle in 1..<(u32)(self.names.length() + 3):
+                try put_u32(&self.reply, handle)
+            return ok
+        let handle = parameters[0] if parameters.length > 0 else 0
+        if operation == get_object_info:
+            var info = ObjectInfo(storage = virtual_storage, format = association_format)
+            if handle == dcim_handle:
+                info.name = "DCIM"
+            elif handle == roll_handle:
+                info.name = "100LUCE"
+                info.parent = dcim_handle
+            elif let at = self.file_at(handle):
+                info.name = self.names.at(at)
+                info.format = format_of(info.name)
+                info.size = self.sizes.at(at)
+                info.parent = roll_handle
+                info.captured = "20261013T120000"
+                info.modified = "20261013T120000"
+            else:
+                return 0x2009
+            try put_object_info(&self.reply, &info)
+            return ok
+        if operation == get_object or operation == get_partial_object and self.partial:
+            let at = self.file_at(handle) else return 0x2009
+            try self.read_file(at, parameters, operation == get_partial_object)
+            return ok
+        return 0x2005
+
+    ## The position in `names` of file `handle`.
+    func file_at(handle: u32) -> usize?:
+        if handle < first_file or (usize)(handle - first_file) >= self.names.length():
+            return none
+        return (usize)(handle - first_file)
+
+    ## Put file `at` into the reply: whole, or (`partial`) the piece the parameters ask for.
+    func read_file(at: usize, parameters: const u32[], partial: bool) -> !:
+        self.path.clear()
+        let joined = try paths.join(self.folder.text(), self.names.at(at))
+        defer joined.release()
+        try self.path.put_text(joined.value)
+        var file = try files.File.open(try self.path.terminated())
+        defer file.destroy()
+        var offset: u64 = 0
+        var wanted = (u64)self.sizes.at(at)
+        if partial:
+            offset = (u64)parameters[1] if parameters.length > 1 else 0
+            let asked = (u64)parameters[2] if parameters.length > 2 else 0
+            let left = wanted - offset if offset < wanted else 0
+            wanted = asked if asked < left else left
+        _ = try file.seek((i64)offset)
+        var chunk: u8[65536]
+        while wanted > 0:
+            let want = (usize)wanted if wanted < (u64)chunk.length else chunk.length
+            let got = try file.read(chunk[..<want])
+            if got == 0:
+                break
+            try self.reply.put(chunk[..<got])
+            wanted -= (u64)got
+
+    func put_device_info() -> !:
+        try put_u16(&self.reply, 100)
+        try put_u32(&self.reply, 0)
+        try put_u16(&self.reply, 0)
+        try put_text(&self.reply, "")
+        try put_u16(&self.reply, 0)
+        var operations: List[u16]
+        defer operations.destroy()
+        for code in [get_device_info, open_session, close_session, get_storage_ids, get_storage_info, get_object_handles, get_object_info, get_object]:
+            try operations.append(code)
+        if self.partial:
+            try operations.append(get_partial_object)
+        try put_u16_array(&self.reply, operations.view())
+        for _at in 0..<3:
+            # An empty array: its count alone.
+            try put_u32(&self.reply, 0)
+        try put_u16_array(&self.reply, [exif_jpeg_format, dng_format])
+        try put_text(&self.reply, "Luce")
+        try put_text(&self.reply, "Virtual Camera")
+        try put_text(&self.reply, "1.0")
+        try put_text(&self.reply, "0001")
+
+## A transport to a camera holding the files directly in `folder` (read when the camera
+## is made), in a DCIM/100LUCE folder of one card. `partial` offers GetPartialObject;
+## `bare_data` sends the data phase without its container header.
+pub func virtual_camera(folder: str, partial: bool = true, bare_data: bool = false) -> Transport!:
+    let made = try new Virtual(partial = partial, bare_data = bare_data) in memory.heap
+    errdefer virtual_close((void*)made)
+    try made.folder.put_text(folder)
+    let listed = try files.list(try made.folder.terminated())
+    defer listed.release()
+    for name in listed.value:
+        if name.length == 0 or name.bytes[0] == '.':
+            continue
+        let joined = try paths.join(folder, name)
+        defer joined.release()
+        let terminated = try strings.copy(joined.value)
+        defer strings.release(terminated)
+        let stat = try files.metadata((c.str)terminated)
+        if stat.kind != files.FileKind.regular:
+            continue
+        try made.names.append(try made.pool.keep_text(name.bytes))
+        try made.sizes.append((u32)stat.size)
+    return Transport(context = (void*)made, exchange = virtual_exchange, close = virtual_close, holds_session = false)
+
+func virtual_close(context: void*):
+    let made = (Virtual*)context
+    made.close()
+    free(made) in memory.heap
+
+## The format a camera gives a file of this name.
+func format_of(name: str) -> u16:
+    let extension = paths.extension(name)
+    if extension == ".JPG" or extension == ".jpg" or extension == ".JPEG" or extension == ".jpeg":
+        return exif_jpeg_format
+    if extension == ".DNG" or extension == ".dng":
+        return dng_format
+    return undefined_format
+
+func virtual_exchange(context: void*, command: const u8[], data_out: const u8[], data_in: Buffer*, response: Buffer*) -> !:
+    let camera = (Virtual*)context
+    let header = try read_header(command)
+    if header.kind != command_container or (usize)header.length != command.length:
+        error(malformed, "the virtual camera was sent something other than a command")
+    var reader = Reader(data = command, at = header_size)
+    var parameters: u32[5]
+    var count: usize = 0
+    while reader.at < command.length and count < 5:
+        parameters[count] = try reader.read_u32()
+        count += 1
+    camera.reply.clear()
+    let code = try camera.answer(header.code, parameters[..<count])
+    if camera.reply.length() > 0:
+        if camera.bare_data:
+            try data_in.put(camera.reply.view())
+        else:
+            try put_data(data_in, header.code, header.transaction, camera.reply.view())
+    try put_container(response, response_container, code, header.transaction, no_parameters())

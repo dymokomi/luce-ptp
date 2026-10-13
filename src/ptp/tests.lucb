@@ -1,0 +1,136 @@
+#==============================================================================================
+#
+#   ptp/tests - The protocol against the virtual camera
+#
+#   DESCRIPTION:
+#       A folder of made-up files becomes a camera: the session opens, the device, the
+#       storage and every object read back as the folder says, and each file downloads
+#       byte for byte, in pieces across their boundaries and whole, with and without
+#       the data phase's container header. A stopped download leaves nothing behind.
+#
+#==============================================================================================
+
+## `count` bytes no two of which repeat in step with a piece.
+func pattern(count: usize, seed: u8, into: Buffer*) -> !:
+    for at in 0..<count:
+        try into.put_byte((u8)((at * 7 + at // 251 + (usize)seed) & 0xFF))
+
+## The pieces the tests download in, and the raw's size: three pieces and a bit.
+let test_piece: u32 = 4096
+let raw_size: usize = 12291
+
+## A folder holding a raw, a small JPEG and a hidden file.
+func card(folder: str) -> !:
+    var bytes: Buffer
+    defer bytes.destroy()
+    try pattern(raw_size, 1, &bytes)
+    for (name, size) in [("L1000001.DNG", raw_size), ("L1000002.JPG", 4099), (".hidden", 10)]:
+        let joined = try paths.join(folder, name)
+        defer joined.release()
+        let terminated = try strings.copy(joined.value)
+        defer strings.release(terminated)
+        try files.write((c.str)terminated, bytes.view()[..<(usize)size])
+
+func same_file(left: str, right: str) -> bool!:
+    let a = try strings.copy(left)
+    defer strings.release(a)
+    let b = try strings.copy(right)
+    defer strings.release(b)
+    let first = try files.read((c.str)a)
+    defer first.release()
+    let second = try files.read((c.str)b)
+    defer second.release()
+    if first.value.length != second.value.length:
+        return false
+    for at in 0..<first.value.length:
+        if first.value[at] != second.value[at]:
+            return false
+    return true
+
+## Download every photo of the camera over `transport` into `into` and compare.
+func round_trip(transport: Transport, folder: str, into: str) -> !:
+    var camera = try Camera.open(transport)
+    defer camera.close()
+    camera.piece_size = test_piece
+    assert(camera.device.model == "Virtual Camera" and camera.device.manufacturer == "Luce")
+    var stores: List[u32]
+    defer stores.destroy()
+    try camera.storages(&stores)
+    assert(stores.length() == 1)
+    var pool: TextPool
+    defer pool.destroy()
+    let storage = try camera.storage_info(stores.at(0), &pool)
+    assert(storage.description == "Virtual card")
+    var handles: List[u32]
+    defer handles.destroy()
+    try camera.handles(&handles)
+    assert(handles.length() == 4)
+    var photos: usize = 0
+    for handle in handles.view():
+        let info = try camera.object_info(handle, &pool)
+        if info.is_folder():
+            assert(info.name == "DCIM" or info.name == "100LUCE")
+            continue
+        photos += 1
+        assert(info.format == (dng_format if info.name == "L1000001.DNG" else exif_jpeg_format))
+        assert(info.captured == "20261013T120000")
+        let source = try paths.join(folder, info.name)
+        defer source.release()
+        let target = try paths.join(into, info.name)
+        defer target.release()
+        try camera.download(handle, info.size, target.value)
+        assert(try same_file(source.value, target.value))
+    assert(photos == 2)
+
+test "PTP text and containers round-trip":
+    var out: Buffer
+    defer out.destroy()
+    try put_text(&out, "LEICA M11-D · 📷")
+    try put_text(&out, "")
+    var pool: TextPool
+    defer pool.destroy()
+    var reader = Reader(data = out.view())
+    assert(try reader.text(&pool) == "LEICA M11-D · 📷")
+    assert(try reader.text(&pool) == "")
+    out.clear()
+    try put_container(&out, command_container, get_object_info, 7, [42])
+    let header = try read_header(out.view())
+    assert(header.length == 16 and header.kind == command_container and header.code == get_object_info and header.transaction == 7)
+    var dated: Buffer
+    defer dated.destroy()
+    assert(try iso_date("20261013T094512.3", &dated) and dated.text() == "2026-10-13T09:45:12")
+    assert(not try iso_date("2026", &dated))
+
+test "a virtual camera's photos download in pieces, whole, with and without headers":
+    var folder = try files.TemporaryDirectory()
+    defer folder.destroy()
+    try card(folder.path())
+    for (partial, bare) in [(true, false), (false, false), (true, true)]:
+        var into = try files.TemporaryDirectory()
+        defer into.destroy()
+        try round_trip(try virtual_camera(folder.path(), partial = partial, bare_data = bare), folder.path(), into.path())
+
+test "a refused operation and a stopped download":
+    var folder = try files.TemporaryDirectory()
+    defer folder.destroy()
+    try card(folder.path())
+    var camera = try Camera.open(try virtual_camera(folder.path()))
+    defer camera.close()
+    camera.piece_size = test_piece
+    var pool: TextPool
+    defer pool.destroy()
+    let missing = camera.object_info(999, &pool) catch failure:
+        assert(failure.code == refused and camera.last_response() == 0x2009)
+        recover ObjectInfo()
+    assert(missing.name == "")
+    let target = try paths.join(folder.path(), "copy.DNG")
+    defer target.release()
+    let stop = Progress(call = stop_after_one, context = none)
+    camera.download(3, (u32)raw_size, target.value, stop) catch failure:
+        assert(failure.code == cancelled)
+    let terminated = try strings.copy(target.value)
+    defer strings.release(terminated)
+    assert(not files.exists((c.str)terminated))
+
+func stop_after_one(context: void*?, done: u64, total: u64) -> bool:
+    return false

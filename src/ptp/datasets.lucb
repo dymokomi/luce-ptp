@@ -1,0 +1,146 @@
+# mark: DeviceInfo ============================================================================
+
+## What a camera says of itself (GetDeviceInfo); text in the camera's pool.
+pub struct DeviceInfo:
+    pub var standard_version: u16
+    pub var vendor_extension: u32
+    pub var manufacturer: str
+    pub var model: str
+    pub var device_version: str
+    pub var serial_number: str
+    ## The operations it supports.
+    pub var operations: List[u16]
+
+    pub func supports(operation: u16) -> bool:
+        for code in self.operations.view():
+            if code == operation:
+                return true
+        return false
+
+    pub func close():
+        self.operations.destroy()
+
+pub func read_device_info(data: const u8[], pool: TextPool*) -> DeviceInfo!:
+    var reader = Reader(data = data)
+    var info = DeviceInfo(standard_version = try reader.read_u16(), vendor_extension = try reader.read_u32())
+    errdefer info.close()
+    _ = try reader.read_u16()
+    _ = try reader.text(pool)
+    _ = try reader.read_u16()
+    try reader.read_u16_array(&info.operations)
+    var skipped: List[u16]
+    defer skipped.destroy()
+    # Events, device properties, capture formats, image formats.
+    for _at in 0..<4:
+        try reader.read_u16_array(&skipped)
+    info.manufacturer = try reader.text(pool)
+    info.model = try reader.text(pool)
+    info.device_version = try reader.text(pool)
+    info.serial_number = try reader.text(pool)
+    return info
+
+# mark: StorageInfo ===========================================================================
+
+## One storage (a card) of the camera (GetStorageInfo).
+pub struct StorageInfo:
+    pub var capacity: u64
+    pub var available: u64
+    pub var description: str
+    pub var label: str
+
+pub func read_storage_info(data: const u8[], pool: TextPool*) -> StorageInfo!:
+    var reader = Reader(data = data)
+    # Storage type, filesystem type, access capability.
+    for _at in 0..<3:
+        _ = try reader.read_u16()
+    let capacity = try reader.read_u64()
+    let available = try reader.read_u64()
+    _ = try reader.read_u32()
+    return StorageInfo(capacity = capacity, available = available, description = try reader.text(pool), label = try reader.text(pool))
+
+# mark: ObjectInfo ============================================================================
+
+## One object on the camera (GetObjectInfo): a photo, another file, or a folder.
+pub struct ObjectInfo:
+    pub var storage: u32
+    pub var format: u16
+    ## Its size in bytes; 0xFFFFFFFF when it is 4 GiB or more.
+    pub var size: u32
+    pub var width: u32
+    pub var height: u32
+    ## The folder it is in (0: at the storage's top).
+    pub var parent: u32
+    pub var name: str
+    ## "YYYYMMDDThhmmss", maybe with tenths and a zone; empty when the camera does not say.
+    pub var captured: str
+    pub var modified: str
+
+    ## Whether it is a folder.
+    pub func is_folder() -> bool:
+        return self.format == association_format
+
+## The ObjectInfo dataset in `data`, its text kept in `pool`.
+pub func read_object_info(data: const u8[], pool: TextPool*) -> ObjectInfo!:
+    var reader = Reader(data = data)
+    var info = ObjectInfo(storage = try reader.read_u32(), format = try reader.read_u16())
+    _ = try reader.read_u16()
+    info.size = try reader.read_u32()
+    # Thumbnail format, size, width, height.
+    _ = try reader.read_u16()
+    for _at in 0..<3:
+        _ = try reader.read_u32()
+    info.width = try reader.read_u32()
+    info.height = try reader.read_u32()
+    _ = try reader.read_u32()
+    info.parent = try reader.read_u32()
+    # Association type and description, sequence number.
+    _ = try reader.read_u16()
+    _ = try reader.read_u32()
+    _ = try reader.read_u32()
+    info.name = try reader.text(pool)
+    info.captured = try reader.text(pool)
+    info.modified = try reader.text(pool)
+    return info
+
+## Put `info` as an ObjectInfo dataset (the virtual camera's side).
+pub func put_object_info(out: Buffer*, info: const ObjectInfo*) -> !:
+    try put_u32(out, info.storage)
+    try put_u16(out, info.format)
+    try put_u16(out, 0)
+    try put_u32(out, info.size)
+    try put_u16(out, 0)
+    for _at in 0..<3:
+        try put_u32(out, 0)
+    try put_u32(out, info.width)
+    try put_u32(out, info.height)
+    try put_u32(out, 0)
+    try put_u32(out, info.parent)
+    try put_u16(out, 1 if info.is_folder() else 0)
+    try put_u32(out, 0)
+    try put_u32(out, 0)
+    try put_text(out, info.name)
+    try put_text(out, info.captured)
+    try put_text(out, info.modified)
+    try put_text(out, "")
+
+## A PTP date ("YYYYMMDDThhmmss…") as "YYYY-MM-DDTHH:MM:SS" into `out`; false (and
+## `out` left alone) when it is not one.
+pub func iso_date(date: str, out: Buffer*) -> bool!:
+    let bytes = date.bytes
+    if bytes.length < 15 or bytes[8] != 'T':
+        return false
+    for at in 0..<15:
+        if at != 8 and (bytes[at] < '0' or bytes[at] > '9'):
+            return false
+    try out.put(bytes[0..<4])
+    try out.put_byte('-')
+    try out.put(bytes[4..<6])
+    try out.put_byte('-')
+    try out.put(bytes[6..<8])
+    try out.put_byte('T')
+    try out.put(bytes[9..<11])
+    try out.put_byte(':')
+    try out.put(bytes[11..<13])
+    try out.put_byte(':')
+    try out.put(bytes[13..<15])
+    return true

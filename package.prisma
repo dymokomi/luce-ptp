@@ -1,0 +1,19 @@
+#prisma 4.0
+def package "luce-ptp" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "Cameras over PTP (ISO 15740): find the cameras plugged in, read their storages and photos, and download them. macOS reaches the camera through ImageCaptureCore's PTP pass-through; a virtual camera serves a folder for tests."
+    str readme = "README.md"
+    str[] public = ["ptp"]
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+
+    def native "macos" {
+        str[] frameworks = ["ImageCaptureCore", "Foundation", "CoreFoundation"]
+    }
+}

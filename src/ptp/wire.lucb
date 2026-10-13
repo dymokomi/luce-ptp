@@ -1,0 +1,178 @@
+# mark: Containers ============================================================================
+
+## A container's 12-byte header: its whole length, what it carries, the operation or
+## response code, and the transaction it belongs to.
+pub struct Header:
+    pub var length: u32
+    pub var kind: u16
+    pub var code: u16
+    pub var transaction: u32
+
+pub let header_size: usize = 12
+
+## The header at the start of `bytes`.
+pub func read_header(bytes: const u8[]) -> Header!:
+    if bytes.length < header_size:
+        error(malformed, "a PTP container is shorter than its header")
+    var reader = Reader(data = bytes)
+    return Header(length = try reader.read_u32(), kind = try reader.read_u16(), code = try reader.read_u16(), transaction = try reader.read_u32())
+
+## Put a container header for `payload` bytes after it.
+func put_header(out: Buffer*, kind: u16, code: u16, transaction: u32, payload: usize) -> !:
+    if payload > 0xFFFFFFFF - header_size:
+        error(malformed, "a PTP container cannot hold that much")
+    try put_u32(out, (u32)(header_size + payload))
+    try put_u16(out, kind)
+    try put_u16(out, code)
+    try put_u32(out, transaction)
+
+## Put a container of `kind` carrying `code` and up to five parameters.
+pub func put_container(out: Buffer*, kind: u16, code: u16, transaction: u32, parameters: const u32[]) -> !:
+    if parameters.length > 5:
+        error(malformed, "a PTP operation takes at most five parameters")
+    try put_header(out, kind, code, transaction, parameters.length * 4)
+    for value in parameters:
+        try put_u32(out, value)
+
+## Put a data container carrying `payload`.
+pub func put_data(out: Buffer*, code: u16, transaction: u32, payload: const u8[]) -> !:
+    try put_header(out, data_container, code, transaction, payload.length)
+    try out.put(payload)
+
+## The data phase's bytes without their container header, when they came with one (a
+## transport passes either). A header is recognised by its type and code and by a
+## length that is exactly the bytes'.
+pub func payload_of(bytes: const u8[], code: u16) -> const u8[]:
+    if bytes.length < header_size:
+        return bytes
+    let header = read_header(bytes) catch failure:
+        return bytes
+    if header.kind == data_container and header.code == code and (usize)header.length == bytes.length:
+        return bytes[header_size..]
+    return bytes
+
+# mark: Writing fields ========================================================================
+
+pub func put_u16(out: Buffer*, value: u16) -> !:
+    try out.put_byte((u8)(value & 0xFF))
+    try out.put_byte((u8)(value >> 8))
+
+pub func put_u32(out: Buffer*, value: u32) -> !:
+    for shift in [0, 8, 16, 24]:
+        try out.put_byte((u8)((value >> (u32)shift) & 0xFF))
+
+pub func put_u64(out: Buffer*, value: u64) -> !:
+    try put_u32(out, (u32)(value & 0xFFFFFFFF))
+    try put_u32(out, (u32)(value >> 32))
+
+## Put `text` (UTF-8) as a PTP string: a count of UTF-16 units with the terminating
+## zero, then the units; nothing but a zero count for empty text. At most 254 units.
+pub func put_text(out: Buffer*, text: str) -> !:
+    if text.length == 0:
+        try out.put_byte(0)
+        return
+    var units: u16[254]
+    var count: usize = 0
+    var at: usize = 0
+    while at < text.length:
+        let decoded = utf8.decode(text.bytes, at) else error(malformed, "PTP text must be UTF-8")
+        at += decoded.width
+        var scalar = (u32)decoded.scalar
+        if scalar >= 0x10000:
+            if count + 2 > units.length:
+                break
+            scalar -= 0x10000
+            units[count] = (u16)(0xD800 + (scalar >> 10))
+            units[count + 1] = (u16)(0xDC00 + (scalar & 0x3FF))
+            count += 2
+        else:
+            if count + 1 > units.length:
+                break
+            units[count] = (u16)scalar
+            count += 1
+    try out.put_byte((u8)(count + 1))
+    for value in units[..<count]:
+        try put_u16(out, value)
+    try put_u16(out, 0)
+
+pub func put_u16_array(out: Buffer*, values: const u16[]) -> !:
+    try put_u32(out, (u32)values.length)
+    for value in values:
+        try put_u16(out, value)
+
+pub func put_u32_array(out: Buffer*, values: const u32[]) -> !:
+    try put_u32(out, (u32)values.length)
+    for value in values:
+        try put_u32(out, value)
+
+# mark: Reading fields ========================================================================
+
+## Fields read in order from `data`; reading past its end fails with `malformed`.
+pub struct Reader:
+    pub var data: const u8[]
+    pub var at: usize
+
+    func take(count: usize) -> const u8[]!:
+        if count > self.data.length - self.at:
+            error(malformed, "a PTP dataset ends early")
+        let taken = self.data[self.at..<self.at + count]
+        self.at += count
+        return taken
+
+    pub func read_u8() -> u8!:
+        return (try self.take(1))[0]
+
+    pub func read_u16() -> u16!:
+        let bytes = try self.take(2)
+        return (u16)bytes[0] | ((u16)bytes[1] << 8)
+
+    pub func read_u32() -> u32!:
+        let bytes = try self.take(4)
+        return (u32)bytes[0] | ((u32)bytes[1] << 8) | ((u32)bytes[2] << 16) | ((u32)bytes[3] << 24)
+
+    pub func read_u64() -> u64!:
+        let low = try self.read_u32()
+        let high = try self.read_u32()
+        return (u64)low | ((u64)high << 32)
+
+    ## A PTP string as UTF-8, kept in `pool`; unpaired surrogates become U+FFFD.
+    pub func text(pool: TextPool*) -> str!:
+        let count = (usize)(try self.read_u8())
+        if count == 0:
+            return ""
+        let units = try self.take(count * 2)
+        var out: Buffer
+        defer out.destroy()
+        var at: usize = 0
+        while at < count:
+            var scalar = (u32)units[at * 2] | ((u32)units[at * 2 + 1] << 8)
+            at += 1
+            if scalar == 0:
+                break
+            if scalar >= 0xD800 and scalar < 0xDC00 and at < count:
+                let low = (u32)units[at * 2] | ((u32)units[at * 2 + 1] << 8)
+                if low >= 0xDC00 and low < 0xE000:
+                    scalar = 0x10000 + ((scalar - 0xD800) << 10) + (low - 0xDC00)
+                    at += 1
+                else:
+                    scalar = 0xFFFD
+            elif scalar >= 0xD800 and scalar < 0xE000:
+                scalar = 0xFFFD
+            var encoded: u8[4]
+            let length = utf8.encode(scalar, encoded) else 0
+            try out.put(encoded[..<length])
+        return try pool.keep_text(out.view())
+
+    pub func read_u16_array(into: List[u16]*) -> !:
+        let count = (usize)(try self.read_u32())
+        if count > (self.data.length - self.at) // 2:
+            error(malformed, "a PTP array is longer than its dataset")
+        for _at in 0..<count:
+            try into.append(try self.read_u16())
+
+    pub func read_u32_array(into: List[u32]*) -> !:
+        let count = (usize)(try self.read_u32())
+        if count > (self.data.length - self.at) // 4:
+            error(malformed, "a PTP array is longer than its dataset")
+        for _at in 0..<count:
+            try into.append(try self.read_u32())

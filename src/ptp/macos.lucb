@@ -1,0 +1,386 @@
+# mark: ImageCaptureCore ======================================================================
+#
+# macOS hands every PTP camera to its camera service when it is plugged in; a program
+# reaches it through ImageCaptureCore. An ICDeviceBrowser reports cameras as they come
+# and go; a session is opened on each (requestOpenSession), and once it is open the
+# containers this package builds pass through untouched with
+# requestSendPTPCommand:outData:completion:. Everything ImageCaptureCore says arrives
+# on the main thread: its delegate methods are a class made here at run time, and the
+# completion is a block laid out here by hand (a global block, which the runtime never
+# copies or frees, carrying its Link after the standard fields).
+#
+# A Link is one camera's connection, shared by the watcher (while the camera is
+# plugged in), each transport made to it, and each command in flight; the last to let
+# it go frees it. A transaction runs on the caller's thread: it hands the command to
+# the main thread and waits until the completion fills its buffers, or the camera goes.
+
+extern func pthread_main_np() -> i32
+extern func objc_getClass(name: c.str) -> void*?
+extern func objc_getProtocol(name: c.str) -> void*?
+extern func sel_registerName(name: c.str) -> void*
+extern func objc_allocateClassPair(parent: void*, name: c.str, extra: usize) -> void*?
+extern func objc_registerClassPair(native_type: void*)
+extern func objc_disposeClassPair(native_type: void*)
+extern func class_addIvar(native_type: void*, name: c.str, size: usize, alignment: u8, encoding: c.str) -> bool
+extern func class_addMethod(native_type: void*, selector: void*, implementation: void*, encoding: c.str) -> bool
+extern func class_addProtocol(native_type: void*, protocol: void*) -> bool
+extern func object_setInstanceVariable(object: void*, name: c.str, value: void*?) -> void*?
+extern func object_getInstanceVariable(object: void*, name: c.str, value: void*?*) -> void*?
+extern func dispatch_async_f(queue: void*, context: void*?, work: void*)
+extern var _dispatch_main_q: u8
+extern var _NSConcreteGlobalBlock: u8
+## The capability a camera must list to take PTP commands (every PTP camera does).
+extern var ICCameraDeviceCanAcceptPTPCommands: void*
+extern func mac_msg_ptr as "objc_msgSend"(object: void*, selector: void*) -> void*?
+extern func mac_msg_void as "objc_msgSend"(object: void*, selector: void*)
+extern func mac_msg_object as "objc_msgSend"(object: void*, selector: void*, value: void*?)
+extern func mac_msg_u64_arg as "objc_msgSend"(object: void*, selector: void*, value: u64)
+extern func mac_msg_u64 as "objc_msgSend"(object: void*, selector: void*) -> u64
+extern func mac_msg_bool_object as "objc_msgSend"(object: void*, selector: void*, value: void*) -> bool
+extern func mac_msg_bytes as "objc_msgSend"(object: void*, selector: void*) -> const u8*?
+extern func mac_msg_text as "objc_msgSend"(object: void*, selector: void*) -> c.str?
+extern func mac_msg_init_data as "objc_msgSend"(object: void*, selector: void*, bytes: const u8*, length: u64) -> void*?
+extern func mac_msg_send_ptp as "objc_msgSend"(object: void*, selector: void*, command: void*, data: void*?, completion: void*)
+
+## The block ABI (clang's Block_layout): a global block with a signature.
+extern struct LucePtpBlockDescriptor:
+    reserved: u64
+    size: u64
+    signature: c.str?
+
+extern struct LucePtpBlock:
+    isa: void*?
+    flags: i32
+    reserved: i32
+    invoke: void*?
+    descriptor: LucePtpBlockDescriptor*?
+    link: void*?
+
+## BLOCK_IS_GLOBAL | BLOCK_HAS_SIGNATURE.
+let block_flags: i32 = 0x50000000
+## The camera device type and local-device location masks.
+let camera_mask: u64 = 0x1
+let local_mask: u64 = 0x100
+
+let delegate_class_name: c.str = "LucePtpDelegateV1"
+let watcher_ivar: c.str = "luceWatcher"
+var delegate_class: void*?
+
+func mac_sel(name: c.str) -> void*:
+    return sel_registerName(name)
+
+# mark: Links =================================================================================
+
+struct Link:
+    var lock: sync.Mutex
+    var answered: sync.Condition
+    ## The ICCameraDevice, retained.
+    var device: void*
+    var holders: @usize
+    ## Under lock: the camera went away; a command is waiting; its answer came, and
+    ## whether ImageCaptureCore failed it; where the answer goes while one waits.
+    var gone: bool
+    var waiting: bool
+    var done: bool
+    var failed: bool
+    var data_in: Buffer*?
+    var response: Buffer*?
+    ## The command and its data on their way to the main thread (NSData, owned).
+    var command: void*?
+    var data_out: void*?
+    var block: LucePtpBlock
+    var descriptor: LucePtpBlockDescriptor
+
+    func hold():
+        _ = self.holders.add(1, .acq_rel)
+
+    ## The camera went away: wake whoever waits.
+    func lose():
+        self.lock.lock()
+        self.gone = true
+        self.answered.broadcast()
+        self.lock.unlock()
+
+## Let `link` go; the last holder frees it.
+func let_go(link: Link*):
+    if link.holders.sub(1, .acq_rel) != 1:
+        return
+    mac_msg_void(link.device, mac_sel("release"))
+    free(link) in memory.heap
+
+func new_link(device: void*) -> Link*!:
+    let link = try new Link(device = device) in memory.heap
+    _ = mac_msg_ptr(device, mac_sel("retain"))
+    link.holders.store(1, .release)
+    link.descriptor = LucePtpBlockDescriptor(reserved = 0, size = 40, signature = "v32@?0@8@16@24")
+    link.block = LucePtpBlock(isa = (void*)&_NSConcreteGlobalBlock, flags = block_flags, reserved = 0,
+                              invoke = (void*)mac_answered, descriptor = &link.descriptor, link = (void*)link)
+    return link
+
+## A transport over `link` (a Link*): it holds the link until closed.
+func mac_transport(link: void*) -> Transport!:
+    let held = (Link*)link
+    held.hold()
+    return Transport(context = link, exchange = mac_exchange, close = mac_close, holds_session = true)
+
+func mac_close(context: void*):
+    let_go((Link*)context)
+
+## A copy of `bytes` as an NSData the caller owns.
+func mac_data(bytes: const u8[]) -> void*!:
+    let made = mac_msg_ptr(try mac_class("NSData"), mac_sel("alloc")) else error(failed_native, "could not make a PTP command")
+    return mac_msg_init_data(made, mac_sel("initWithBytes:length:"), bytes.data, (u64)bytes.length) else error(failed_native, "could not make a PTP command")
+
+let failed_native: ErrorCode = ErrorCode.package(6)
+
+func mac_class(name: c.str) -> void*!:
+    return objc_getClass(name) else error(unavailable, "ImageCaptureCore is not available")
+
+func mac_exchange(context: void*, command: const u8[], data_out: const u8[], data_in: Buffer*, response: Buffer*) -> !:
+    if pthread_main_np() != 0:
+        trap("a camera's transactions wait for the main thread; run them on another")
+    let link = (Link*)context
+    let sent = try mac_data(command)
+    var carried: void*? = none
+    if data_out.length > 0:
+        carried = mac_data(data_out) catch failure:
+            mac_msg_void(sent, mac_sel("release"))
+            error(failure.code, failure.message)
+    link.lock.lock()
+    if link.gone:
+        link.lock.unlock()
+        mac_msg_void(sent, mac_sel("release"))
+        if let extra = carried:
+            mac_msg_void(extra, mac_sel("release"))
+        error(disconnected, "the camera was disconnected")
+    link.command = sent
+    link.data_out = carried
+    link.data_in = data_in
+    link.response = response
+    link.waiting = true
+    link.done = false
+    link.failed = false
+    # The command in flight holds the link until its completion runs.
+    link.hold()
+    link.lock.unlock()
+    dispatch_async_f((void*)&_dispatch_main_q, (void*)link, (void*)mac_send)
+    link.lock.lock()
+    while not link.done and not link.gone:
+        link.answered.wait(&link.lock)
+    let done = link.done
+    let failed = link.failed
+    link.waiting = false
+    link.data_in = none
+    link.response = none
+    link.lock.unlock()
+    if not done:
+        error(disconnected, "the camera was disconnected")
+    if failed:
+        error(disconnected, "the camera stopped answering")
+
+## On the main thread: hand the command to ImageCaptureCore.
+func mac_send(context: void*?):
+    let link = (Link*)(context else return)
+    link.lock.lock()
+    let command = link.command
+    let carried = link.data_out
+    link.command = none
+    link.data_out = none
+    link.lock.unlock()
+    let sent = command else return
+    mac_msg_send_ptp(link.device, mac_sel("requestSendPTPCommand:outData:completion:"), sent, carried, (void*)&link.block)
+    mac_msg_void(sent, mac_sel("release"))
+    if let extra = carried:
+        mac_msg_void(extra, mac_sel("release"))
+
+## The completion: ImageCaptureCore's answer to the command in flight.
+func mac_answered(block: LucePtpBlock*, data: void*?, response: void*?, failure: void*?):
+    let link = (Link*)(block.link else return)
+    link.lock.lock()
+    if link.waiting:
+        if failure != none:
+            link.failed = true
+        if let into = link.data_in:
+            mac_copy(data, into)
+        if let into = link.response:
+            mac_copy(response, into)
+        link.done = true
+        link.answered.broadcast()
+    link.lock.unlock()
+    let_go(link)
+
+## Append NSData `data`'s bytes to `into` (nothing when there is none); a failure to
+## grow leaves `into` short, which reads as a malformed answer.
+func mac_copy(data: void*?, into: Buffer*):
+    let object = data else return
+    let length = mac_msg_u64(object, mac_sel("length"))
+    if length == 0:
+        return
+    let bytes = mac_msg_bytes(object, mac_sel("bytes")) else return
+    into.put(u8[]((u8*)bytes, (usize)length)) catch failure:
+        _ = failure
+
+# mark: The browser and the delegate ==========================================================
+
+## The native objects behind a watcher.
+struct Browser:
+    var browser: void*
+    var delegate: void*
+
+func mac_start(watcher: Watcher*) -> !:
+    let delegate_type = try mac_delegate_class()
+    let delegate = mac_msg_ptr(mac_msg_ptr(delegate_type, mac_sel("alloc")) else error(failed_native, "could not make the camera delegate"), mac_sel("init")) else error(failed_native, "could not make the camera delegate")
+    _ = object_setInstanceVariable(delegate, watcher_ivar, (void*)watcher)
+    let made = mac_msg_ptr(try mac_class("ICDeviceBrowser"), mac_sel("alloc")) else error(unavailable, "ImageCaptureCore is not available")
+    let browser = mac_msg_ptr(made, mac_sel("init")) else error(unavailable, "ImageCaptureCore is not available")
+    mac_msg_object(browser, mac_sel("setDelegate:"), delegate)
+    mac_msg_u64_arg(browser, mac_sel("setBrowsedDeviceTypeMask:"), camera_mask | local_mask)
+    mac_msg_void(browser, mac_sel("start"))
+    let native = try new Browser(browser = browser, delegate = delegate) in memory.heap
+    watcher.native = (void*)native
+
+func mac_stop(watcher: Watcher*):
+    let native = (Browser*)(watcher.native else return)
+    _ = object_setInstanceVariable(native.delegate, watcher_ivar, none)
+    mac_msg_void(native.browser, mac_sel("stop"))
+    mac_msg_object(native.browser, mac_sel("setDelegate:"), none)
+    for found in watcher.cameras.view():
+        mac_let_camera_go((Link*)found.link)
+    watcher.cameras.clear()
+    mac_msg_void(native.browser, mac_sel("release"))
+    mac_msg_void(native.delegate, mac_sel("release"))
+    free(native) in memory.heap
+    watcher.native = none
+
+## Close the session on a camera the watcher lets go and drop the watcher's hold.
+func mac_let_camera_go(link: Link*):
+    link.lose()
+    mac_msg_void(link.device, mac_sel("requestCloseSession"))
+    mac_msg_object(link.device, mac_sel("setDelegate:"), none)
+    let_go(link)
+
+func mac_delegate_class() -> void*!:
+    if let made = delegate_class:
+        return made
+    let native_type = objc_allocateClassPair(try mac_class("NSObject"), delegate_class_name, 0) else error(failed_native, "could not make the camera delegate")
+    errdefer objc_disposeClassPair(native_type)
+    if not class_addIvar(native_type, watcher_ivar, 8, 3, "^v"):
+        error(failed_native, "could not make the camera delegate")
+    for protocol in ["ICDeviceBrowserDelegate", "ICCameraDeviceDelegate"]:
+        if let found = objc_getProtocol((c.str)protocol):
+            _ = class_addProtocol(native_type, found)
+    # The browser.
+    try mac_method(native_type, "deviceBrowser:didAddDevice:moreComing:", (void*)mac_added, "v@:@@B")
+    try mac_method(native_type, "deviceBrowser:didRemoveDevice:moreGoing:", (void*)mac_removed, "v@:@@B")
+    try mac_method(native_type, "deviceBrowserDidEnumerateLocalDevices:", (void*)mac_enumerated, "v@:@")
+    # Each camera's session.
+    try mac_method(native_type, "device:didOpenSessionWithError:", (void*)mac_opened, "v@:@@")
+    try mac_method(native_type, "device:didCloseSessionWithError:", (void*)mac_closed, "v@:@@")
+    try mac_method(native_type, "didRemoveDevice:", (void*)mac_device_removed, "v@:@")
+    # What else a camera's delegate must answer: nothing to do. No thumbnails or
+    # metadata are wanted from the service; the package reads what it needs itself.
+    for name in ["deviceDidBecomeReady:", "deviceDidBecomeReadyWithCompleteContentCatalog:", "cameraDeviceDidChangeCapability:",
+                 "cameraDeviceDidRemoveAccessRestriction:", "cameraDeviceDidEnableAccessRestriction:", "deviceDidChangeName:"]:
+        try mac_method(native_type, (c.str)name, (void*)mac_ignore_one, "v@:@")
+    for name in ["cameraDevice:didAddItems:", "cameraDevice:didRemoveItems:", "cameraDevice:didRenameItems:", "cameraDevice:didReceivePTPEvent:",
+                 "device:didEncounterError:", "device:didReceiveStatusInformation:", "device:didEjectWithError:"]:
+        try mac_method(native_type, (c.str)name, (void*)mac_ignore_two, "v@:@@")
+    for name in ["cameraDevice:didReceiveThumbnail:forItem:error:", "cameraDevice:didReceiveMetadata:forItem:error:"]:
+        try mac_method(native_type, (c.str)name, (void*)mac_ignore_four, "v@:@@@@")
+    for name in ["cameraDevice:shouldGetThumbnailOfItem:", "cameraDevice:shouldGetMetadataOfItem:"]:
+        try mac_method(native_type, (c.str)name, (void*)mac_refuse, "B@:@@")
+    objc_registerClassPair(native_type)
+    delegate_class = native_type
+    return native_type
+
+func mac_method(native_type: void*, name: c.str, implementation: void*, encoding: c.str) -> !:
+    if not class_addMethod(native_type, mac_sel(name), implementation, encoding):
+        error(failed_native, "could not make the camera delegate")
+
+func mac_watcher(delegate: void*) -> Watcher*?:
+    var pointer: void*?
+    _ = object_getInstanceVariable(delegate, watcher_ivar, &pointer)
+    let value = pointer else return none
+    return (Watcher*)value
+
+## The position of `device`'s camera in the watcher, or -1.
+func mac_position(watcher: Watcher*, device: void*) -> i64:
+    for (at, found) in watcher.cameras.view().indexed():
+        if ((Link*)found.link).device == device:
+            return (i64)at
+    return -1
+
+func mac_added(delegate: void*, selector: void*, browser: void*, device: void*, more: bool):
+    let watcher = mac_watcher(delegate) else return
+    if mac_msg_u64(device, mac_sel("type")) & camera_mask == 0 or mac_position(watcher, device) >= 0:
+        return
+    var name = "Camera"
+    if let text = mac_msg_ptr(device, mac_sel("name")):
+        if let utf8_name = mac_msg_text(text, mac_sel("UTF8String")):
+            name = (str)utf8_name
+    let link = new_link(device) catch failure:
+        return
+    let kept = watcher.names.keep_text(name.bytes) catch failure:
+        recover "Camera"
+    watcher.cameras.append(Found(name = kept, ready = false, link = (void*)link)) catch failure:
+        let_go(link)
+        return
+    mac_msg_object(device, mac_sel("setDelegate:"), delegate)
+    mac_msg_void(device, mac_sel("requestOpenSession"))
+    watcher.changed()
+
+func mac_enumerated(delegate: void*, selector: void*, browser: void*):
+    let watcher = mac_watcher(delegate) else return
+    watcher.enumerated = true
+    watcher.changed()
+
+func mac_forget(delegate: void*, device: void*):
+    let watcher = mac_watcher(delegate) else return
+    let at = mac_position(watcher, device)
+    if at < 0:
+        return
+    let link = (Link*)watcher.cameras.at((usize)at).link
+    watcher.cameras.remove((usize)at)
+    link.lose()
+    mac_msg_object(link.device, mac_sel("setDelegate:"), none)
+    let_go(link)
+    watcher.changed()
+
+func mac_removed(delegate: void*, selector: void*, browser: void*, device: void*, more: bool):
+    mac_forget(delegate, device)
+
+func mac_device_removed(delegate: void*, selector: void*, device: void*):
+    mac_forget(delegate, device)
+
+func mac_set_ready(delegate: void*, device: void*, ready: bool):
+    let watcher = mac_watcher(delegate) else return
+    let at = mac_position(watcher, device)
+    if at < 0:
+        return
+    var found = watcher.cameras.at((usize)at)
+    found.ready = ready
+    watcher.cameras.set((usize)at, found)
+    watcher.changed()
+
+func mac_opened(delegate: void*, selector: void*, device: void*, failure: void*?):
+    mac_set_ready(delegate, device, failure == none and mac_takes_ptp(device))
+
+## Whether `device` lists the capability to take PTP commands.
+func mac_takes_ptp(device: void*) -> bool:
+    let capabilities = mac_msg_ptr(device, mac_sel("capabilities")) else return false
+    return mac_msg_bool_object(capabilities, mac_sel("containsObject:"), ICCameraDeviceCanAcceptPTPCommands)
+
+func mac_closed(delegate: void*, selector: void*, device: void*, failure: void*?):
+    mac_set_ready(delegate, device, false)
+
+func mac_ignore_one(delegate: void*, selector: void*, first: void*?):
+    return
+
+func mac_ignore_two(delegate: void*, selector: void*, first: void*?, second: void*?):
+    return
+
+func mac_ignore_four(delegate: void*, selector: void*, first: void*?, second: void*?, third: void*?, fourth: void*?):
+    return
+
+func mac_refuse(delegate: void*, selector: void*, camera: void*?, item: void*?) -> bool:
+    return false

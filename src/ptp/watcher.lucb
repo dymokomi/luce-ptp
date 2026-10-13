@@ -1,0 +1,89 @@
+# mark: The cameras plugged in ================================================================
+
+## One camera the system found: its name, whether a session is open on it (only then
+## can it be connected), and the platform's link to it.
+struct Found:
+    var name: str
+    var ready: bool
+    var link: void*
+
+## The cameras plugged in, kept current as they come and go. Made on the main thread
+## and used there: on macOS the system tells it of cameras through the main run loop,
+## which the window's event loop runs. Whoever wants to hear of a change gives it a
+## Wake; it is called on the main thread after every change.
+pub struct Watcher:
+    var cameras: List[Found]
+    var names: TextPool
+    var wake: Wake?
+    ## The platform's browser (macOS: the ICDeviceBrowser and its delegate).
+    var native: void*?
+    var reachable: bool
+    var enumerated: bool
+
+    ## Whether this system can reach cameras at all.
+    pub func available() -> bool:
+        return self.reachable
+
+    ## Whether the system has reported every camera plugged in when watching began
+    ## (later ones arrive as they are plugged in).
+    pub func settled() -> bool:
+        return self.enumerated or not self.reachable
+
+    ## How many cameras are plugged in.
+    pub func count() -> i64:
+        return (i64)self.cameras.length()
+
+    func found(at: i64) -> Found:
+        if at < 0 or at >= (i64)self.cameras.length():
+            trap("no camera at that position")
+        return self.cameras.at((usize)at)
+
+    ## The name of camera `at` ("LEICA M11-D").
+    pub func name(at: i64) -> str:
+        return self.found(at).name
+
+    ## Whether camera `at` has its session open, so it can be connected.
+    pub func ready(at: i64) -> bool:
+        return self.found(at).ready
+
+    ## Call `wake` after every change (none: stop).
+    pub func tell(wake: Wake?):
+        self.wake = wake
+
+    func changed():
+        if let told = self.wake:
+            told.call(told.context)
+
+    ## A transport to camera `at`, for Camera.open on another thread (on macOS a
+    ## camera's transactions wait for the main thread, so they must not run on it).
+    pub func connect(at: i64) -> Transport!:
+        let found = self.found(at)
+        if not found.ready:
+            error(disconnected, "the camera is not ready yet")
+        if platform.macos:
+            return try mac_transport(found.link)
+        error(unavailable, "this system cannot reach cameras yet")
+
+    pub func close():
+        if platform.macos:
+            mac_stop(&self)
+        self.cameras.destroy()
+        self.names.destroy()
+        self.wake = none
+
+pub let watcher_type: interop.Type[Watcher] = interop.Type[Watcher]("CameraWatcher", Watcher.close, closeable = true, main_thread = true)
+
+## Start watching for cameras (on the main thread). Where cameras cannot be reached
+## the watcher stays empty and says so (`available`).
+pub func watch() -> interop.Reference[Watcher]!:
+    let made = try new Watcher in memory.heap
+    errdefer free(made) in memory.heap
+    if platform.macos:
+        try mac_start(made)
+        made.reachable = true
+    return try interop.Reference[Watcher].adopt(made, watcher_type, memory.heap)
+
+## Have `watcher` call `call(context)` after every change; a Luce program gives a
+## function it got from its UI (luce-ui's notify handle, say).
+pub func tell_watcher(watcher: interop.Reference[Watcher], wake: Wake?) -> !:
+    (try watcher.get()).tell(wake)

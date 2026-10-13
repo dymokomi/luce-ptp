@@ -1,0 +1,154 @@
+# mark: A session =============================================================================
+
+let nothing: u32[1] = [0]
+
+## No parameters, for an operation that takes none.
+pub func no_parameters() -> const u32[]:
+    return nothing[..<0]
+
+## Told how a download goes: `call(context, done, total)` after every piece; returning
+## false stops it (`cancelled`).
+pub struct Progress:
+    pub var call: func(void*?, u64, u64) -> bool
+    pub var context: void*?
+
+## A camera with a session open: one transaction at a time, from one thread at a time.
+## Data read back (a dataset, a piece of a file) is a view valid until the next
+## transaction. Close it to end the session and let the transport go.
+pub struct Camera:
+    var transport: Transport
+    var transaction: u32
+    var session: bool
+    var command: Buffer
+    var data_out: Buffer
+    var data_in: Buffer
+    var response: Buffer
+    var pool: TextPool
+    ## What the camera said of itself when the session opened (its text in the camera).
+    pub var device: DeviceInfo
+    ## How much one GetPartialObject asks for.
+    pub var piece_size: u32 = 4194304
+
+    ## Open a session over `transport`, which the camera then owns (and closes).
+    pub static func open(transport: Transport) -> Camera!:
+        var camera = Camera(transport = transport)
+        errdefer camera.close()
+        let described = try camera.transact(get_device_info, no_parameters())
+        camera.device = try read_device_info(described, &camera.pool)
+        if not transport.holds_session:
+            camera.transaction = 0
+            camera.run(open_session, [1]) catch failure:
+                if failure.code != refused or camera.last_response() != session_already_open:
+                    error(failure.code, failure.message)
+            camera.session = true
+        return camera
+
+    ## The response code of the last transaction.
+    pub func last_response() -> u16:
+        let header = read_header(self.response.view()) catch failure:
+            return 0
+        return header.code
+
+    ## The `at`th parameter of the last response (0 when it has fewer).
+    pub func response_parameter(at: usize) -> u32:
+        var reader = Reader(data = self.response.view(), at = header_size + at * 4)
+        return reader.read_u32() catch failure:
+            return 0
+
+    ## Run `operation` with `parameters`, sending `data_out` when the operation carries
+    ## data to the camera; the data it sends back (maybe empty). Fails with `refused`
+    ## when it answers other than OK.
+    pub func transact(operation: u16, parameters: const u32[], data_out: const u8[]? = none) -> const u8[]!:
+        self.command.clear()
+        self.data_out.clear()
+        self.data_in.clear()
+        self.response.clear()
+        let transaction = self.transaction
+        self.transaction += 1
+        try put_container(&self.command, command_container, operation, transaction, parameters)
+        if let sending = data_out:
+            try put_data(&self.data_out, operation, transaction, sending)
+        try self.transport.exchange(self.transport.context, self.command.view(), self.data_out.view(), &self.data_in, &self.response)
+        let header = try read_header(self.response.view())
+        if header.kind != response_container:
+            error(malformed, "the camera's answer is not a PTP response")
+        if header.code != ok:
+            error(refused, response_message(header.code))
+        return payload_of(self.data_in.view(), operation)
+
+    ## Run `operation`, ignoring any data it sends back.
+    pub func run(operation: u16, parameters: const u32[]) -> !:
+        _ = try self.transact(operation, parameters)
+
+    ## The camera's storages (its cards), onto `into`.
+    pub func storages(into: List[u32]*) -> !:
+        var reader = Reader(data = try self.transact(get_storage_ids, no_parameters()))
+        try reader.read_u32_array(into)
+
+    ## What storage `id` is; its text kept in `pool`.
+    pub func storage_info(id: u32, pool: TextPool*) -> StorageInfo!:
+        return try read_storage_info(try self.transact(get_storage_info, [id]), pool)
+
+    ## Every object on every storage, folders and their contents alike, onto `into`.
+    pub func handles(into: List[u32]*) -> !:
+        var reader = Reader(data = try self.transact(get_object_handles, [all_storages, 0, 0]))
+        try reader.read_u32_array(into)
+
+    ## What object `handle` is; its text kept in `pool`.
+    pub func object_info(handle: u32, pool: TextPool*) -> ObjectInfo!:
+        return try read_object_info(try self.transact(get_object_info, [handle]), pool)
+
+    ## Download object `handle`, `size` bytes as its ObjectInfo says, to the file at
+    ## `path`: written beside it and renamed into place when whole, so `path` never
+    ## holds part of a file. In pieces when the camera can (GetPartialObject), telling
+    ## `progress` after each; whole otherwise.
+    pub func download(handle: u32, size: u32, path: str, progress: Progress? = none) -> !:
+        let folder = try strings.copy(paths.directory(path))
+        defer strings.release(folder)
+        var file = try files.TemporaryFile.create((c.str)folder, 420)
+        defer file.destroy()
+        let total = (u64)size
+        if self.device.supports(get_partial_object) and size != 0xFFFFFFFF:
+            var done: u32 = 0
+            while done < size:
+                let asked = self.piece_size if size - done > self.piece_size else size - done
+                let piece = try self.transact(get_partial_object, [handle, done, asked])
+                if piece.length == 0:
+                    error(malformed, "the camera sent an empty piece of the file")
+                try write_all(&file, piece)
+                done += (u32)piece.length
+                if let told = progress:
+                    if not told.call(told.context, (u64)done, total):
+                        error(cancelled, "the download was stopped")
+        else:
+            let whole = try self.transact(get_object, [handle])
+            try write_all(&file, whole)
+            if let told = progress:
+                _ = told.call(told.context, (u64)whole.length, (u64)whole.length)
+        let terminated = try strings.copy(path)
+        defer strings.release(terminated)
+        try file.publish((c.str)terminated)
+
+    ## End the session (when it is this side's to end) and let the transport go.
+    pub func close():
+        if self.session:
+            self.run(close_session, no_parameters()) catch failure:
+                _ = failure
+            self.session = false
+        self.transport.close(self.transport.context)
+        self.device.close()
+        self.command.destroy()
+        self.data_out.destroy()
+        self.data_in.destroy()
+        self.response.destroy()
+        self.pool.destroy()
+
+pub let camera_type: interop.Type[Camera] = interop.Type[Camera]("Camera", Camera.close, closeable = true)
+
+func write_all(file: files.TemporaryFile*, data: const u8[]) -> !:
+    var at: usize = 0
+    while at < data.length:
+        let wrote = try file.write(data[at..])
+        if wrote == 0:
+            error(malformed, "the download could not be written")
+        at += wrote

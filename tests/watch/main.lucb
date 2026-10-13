@@ -1,0 +1,126 @@
+## `watch [--download]` watches for cameras as a program would: it runs the main run
+## loop until the system has reported the cameras plugged in and each has its session
+## open, then, on a thread of its own, opens the first, prints what it is, its cards
+## and its photos, and with --download fetches the newest photo to a temporary folder
+## and checks its size. With no camera plugged in it says so and passes.
+import c
+import sync
+import thread
+from luce_std import files
+from luce_std import paths
+from luce_std.collections import List, TextPool
+from luce_ptp import ptp
+
+extern var kCFRunLoopDefaultMode: void*
+extern func CFRunLoopRunInMode(mode: void*, seconds: f64, after_source: bool) -> i32
+
+## What the camera thread and the main thread share.
+struct Probe:
+    var lock: sync.Mutex
+    var transport: ptp.Transport
+    var download: bool
+    var finished: bool
+    var failed: bool
+
+func run_loop():
+    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, true)
+
+func explore(probe: Probe*) -> !:
+    var camera = try ptp.Camera.open(probe.transport)
+    defer camera.close()
+    print(f"camera\t{camera.device.manufacturer} {camera.device.model} {camera.device.device_version} serial {camera.device.serial_number}")
+    print(f"partial objects\t{camera.device.supports(ptp.get_partial_object)}")
+    var pool: TextPool
+    defer pool.destroy()
+    var stores: List[u32]
+    defer stores.destroy()
+    try camera.storages(&stores)
+    for id in stores.view():
+        let card = try camera.storage_info(id, &pool)
+        print(f"card\t{id}\t{card.description}\t{card.label}\t{card.available} of {card.capacity} bytes free")
+    var handles: List[u32]
+    defer handles.destroy()
+    try camera.handles(&handles)
+    var photos: i64 = 0
+    var newest: u32 = 0
+    var newest_size: u32 = 0
+    var newest_name = ""
+    for handle in handles.view():
+        let info = try camera.object_info(handle, &pool)
+        if info.is_folder():
+            continue
+        photos += 1
+        if photos <= 5:
+            print(f"object\t{handle}\t{info.name}\t{info.size}\t{info.captured}\tformat {info.format}")
+        if handle > newest:
+            newest = handle
+            newest_size = info.size
+            newest_name = info.name
+    print(f"objects\t{photos}")
+    if not probe.download or newest == 0:
+        return
+    var folder = try files.TemporaryDirectory()
+    defer folder.destroy()
+    let target = try paths.join(folder.path(), newest_name)
+    defer target.release()
+    try camera.download(newest, newest_size, target.value)
+    let stat = try files.metadata((c.str)target.value)
+    print(f"downloaded\t{newest_name}\t{stat.size} bytes")
+    if stat.size != (i64)newest_size:
+        error(ptp.malformed, "the download's size differs from the camera's")
+
+func serve(context: void*?):
+    let probe = (Probe*)(context else return)
+    explore(probe) catch failure:
+        print(f"error\t{failure.message}")
+        probe.lock.lock()
+        probe.failed = true
+        probe.lock.unlock()
+    probe.lock.lock()
+    probe.finished = true
+    probe.lock.unlock()
+
+func finished(probe: Probe*) -> bool:
+    probe.lock.lock()
+    defer probe.lock.unlock()
+    return probe.finished
+
+pub func main(arguments: c.str[]) -> i32:
+    let watching = ptp.watch() catch failure:
+        print(f"FAIL watch: {failure.message}")
+        return 1
+    defer watching.release()
+    let watcher = watching.get() catch failure:
+        return 1
+    if not watcher.available():
+        print("PASS watch: this system cannot reach cameras yet")
+        return 0
+    while not watcher.settled():
+        run_loop()
+    if watcher.count() == 0:
+        print("PASS watch: no camera plugged in")
+        return 0
+    # A session opens on each camera; give each its turn of the run loop.
+    var turns = 0
+    while not watcher.ready(0) and watcher.count() > 0 and turns < 60:
+        run_loop()
+        turns += 1
+    if watcher.count() == 0 or not watcher.ready(0):
+        print("FAIL watch: the camera's session did not open")
+        return 1
+    print(f"found\t{watcher.name(0)}")
+    let transport = watcher.connect(0) catch failure:
+        print(f"FAIL watch: {failure.message}")
+        return 1
+    var probe = Probe(transport = transport, download = arguments.length > 1 and (str)arguments[1] == "--download")
+    let handle = thread.spawn(serve, (void*)&probe, name = "camera") catch failure:
+        return 1
+    while not finished(&probe):
+        run_loop()
+    handle.join() catch failure:
+        return 1
+    if probe.failed:
+        print("FAIL watch: the camera could not be read")
+        return 1
+    print("PASS watch: the camera was read over PTP")
+    return 0

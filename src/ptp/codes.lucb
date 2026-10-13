@@ -1,0 +1,58 @@
+# mark: Containers ============================================================================
+
+## What a container carries (its header's type field).
+pub let command_container: u16 = 1
+pub let data_container: u16 = 2
+pub let response_container: u16 = 3
+pub let event_container: u16 = 4
+
+# mark: Operations ============================================================================
+
+pub let get_device_info: u16 = 0x1001
+pub let open_session: u16 = 0x1002
+pub let close_session: u16 = 0x1003
+pub let get_storage_ids: u16 = 0x1004
+pub let get_storage_info: u16 = 0x1005
+pub let get_num_objects: u16 = 0x1006
+pub let get_object_handles: u16 = 0x1007
+pub let get_object_info: u16 = 0x1008
+pub let get_object: u16 = 0x1009
+pub let get_thumb: u16 = 0x100A
+pub let get_partial_object: u16 = 0x101B
+
+# mark: Responses =============================================================================
+
+pub let ok: u16 = 0x2001
+pub let session_already_open: u16 = 0x201E
+
+## What response `code` means, as a sentence for an error message.
+pub func response_message(code: u16) -> str:
+    return match code:
+        0x2002 => "the camera reported a general error"
+        0x2003 => "the camera has no session open"
+        0x2004 => "the camera refused the transaction number"
+        0x2005 => "the camera does not support that operation"
+        0x2006 => "the camera does not support that parameter"
+        0x2007 => "the transfer did not complete"
+        0x2008 => "the camera has no such storage"
+        0x2009 => "the camera has no such object"
+        0x200F => "the camera denied access"
+        0x2013 => "the camera's storage is not available"
+        0x2019 => "the camera is busy"
+        0x201F => "the transaction was cancelled"
+        _ => "the camera refused the operation"
+
+# mark: Object formats ========================================================================
+
+## A folder ("association").
+pub let association_format: u16 = 0x3001
+## Image formats sit in 0x3800–0x38FF (EXIF/JPEG 0x3801, TIFF 0x380D, DNG 0x3811);
+## raw files of other makes come as 0x3000 (undefined) or 0x3800 (undefined image)
+## and are told apart by their names.
+pub let undefined_format: u16 = 0x3000
+pub let exif_jpeg_format: u16 = 0x3801
+pub let tiff_format: u16 = 0x380D
+pub let dng_format: u16 = 0x3811
+
+## Asking for the objects of every storage, every format, every folder.
+pub let all_storages: u32 = 0xFFFFFFFF
